@@ -4,7 +4,7 @@
   "description": "ApexAI Voice Metrics dashboard — reads voice_metric_events from MySQL",
   "main": "index.js",
   "scripts": {
-    "start": "node /app/index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "mysql2": "^3.9.1"
