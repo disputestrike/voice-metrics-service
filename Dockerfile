@@ -2,6 +2,9 @@ FROM node:18-alpine
 
 WORKDIR /app
 
+# Cache bust — force clean build
+ARG CACHEBUST=1
+
 # Copy package files and install deps
 COPY package.json ./
 RUN npm install --production
