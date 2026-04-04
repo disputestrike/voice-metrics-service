@@ -52,6 +52,24 @@ async function ensureTable() {
     )
   `);
   console.log("[DB] voice_metric_events table ready");
+
+  // Quality events table — stores per-call guardrail failure results
+  await getPool().execute(`
+    CREATE TABLE IF NOT EXISTS \`call_quality_events\` (
+      \`id\` int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      \`callId\` varchar(128) NOT NULL,
+      \`sessionId\` varchar(128),
+      \`healthy\` tinyint(1) NOT NULL DEFAULT 1,
+      \`failureCount\` int NOT NULL DEFAULT 0,
+      \`failureCodes\` json COMMENT 'Array of failure mode code strings',
+      \`severityBreakdown\` json COMMENT '{trust_killing, conversion_killing, compliance_risk, polish_level}',
+      \`createdAt\` timestamp DEFAULT CURRENT_TIMESTAMP,
+      KEY \`idx_cqe_call\` (\`callId\`),
+      KEY \`idx_cqe_healthy\` (\`healthy\`),
+      KEY \`idx_cqe_created\` (\`createdAt\`)
+    )
+  `);
+  console.log("[DB] call_quality_events table ready");
 }
 
 // ── Auth check ────────────────────────────────────────────────────────────────
@@ -63,6 +81,12 @@ function isAuthed(req) {
 }
 
 // ── JSON response helpers ─────────────────────────────────────────────────────
+function safeJson(val, fallback) {
+  if (val === null || val === undefined) return fallback;
+  if (typeof val === "object") return val; // already parsed by mysql2
+  try { return JSON.parse(val); } catch { return fallback; }
+}
+
 function send(res, status, data) {
   const body = JSON.stringify(data);
   res.writeHead(status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -128,6 +152,28 @@ async function handle(req, res) {
            typeof d.msSinceCallStart === "number" ? d.msSinceCallStart : null,
            d.extra ? JSON.stringify(d.extra) : null]
         );
+
+        // If this is a qa_result event, also write to call_quality_events for dashboard
+        if (d.phase === "qa_result" && d.callId && d.extra) {
+          const ex = d.extra;
+          try {
+            await query(
+              "INSERT INTO `call_quality_events` (`callId`,`sessionId`,`healthy`,`failureCount`,`failureCodes`,`severityBreakdown`) VALUES (?,?,?,?,?,?)",
+              [
+                d.callId,
+                d.sessionId || null,
+                ex.healthy === true ? 1 : 0,
+                typeof ex.failureCount === "number" ? ex.failureCount : 0,
+                ex.codes ? JSON.stringify(ex.codes) : JSON.stringify([]),
+                ex.severity_breakdown ? JSON.stringify(ex.severity_breakdown) : null,
+              ]
+            );
+          } catch (qErr) {
+            // Non-critical — still return 201 for the metric event
+            console.error("[QA] Failed to write call_quality_events:", qErr.message);
+          }
+        }
+
         send(res, 201, { ok: true });
       } catch (e) { send(res, 500, { error: e.message }); }
     });
@@ -179,6 +225,69 @@ async function handle(req, res) {
     return;
   }
 
+  // GET /metrics/quality
+  // Returns call quality summary from the guardrail QA tagger.
+  // Query params: hours (default 24), limit (default 100), healthy (true|false)
+  if (path === "/metrics/quality" && method === "GET") {
+    const hours = Math.min(720, parseInt(parsed.searchParams.get("hours") || "24") || 24);
+    const limit = Math.min(500, parseInt(parsed.searchParams.get("limit") || "100") || 100);
+    const healthyFilter = parsed.searchParams.get("healthy");
+    try {
+      // Overall summary
+      const [totalRow] = await query(
+        "SELECT COUNT(*) AS total, SUM(CASE WHEN healthy=0 THEN 1 ELSE 0 END) AS unhealthy, SUM(healthy) AS healthy FROM `call_quality_events` WHERE createdAt>=NOW()-INTERVAL ? HOUR",
+        [hours]
+      );
+
+      // Failure code frequency
+      const bucketRows = await query(
+        `SELECT phase, COUNT(*) AS cnt FROM \`voice_metric_events\` WHERE phase LIKE 'qa_failure:%' AND createdAt>=NOW()-INTERVAL ? HOUR GROUP BY phase ORDER BY cnt DESC LIMIT 20`,
+        [hours]
+      );
+
+      // Per-call quality detail
+      let sql = "SELECT callId, sessionId, healthy, failureCount, failureCodes, severityBreakdown, createdAt FROM `call_quality_events` WHERE createdAt>=NOW()-INTERVAL ? HOUR";
+      const sqlParams = [hours];
+      if (healthyFilter === "false") { sql += " AND healthy=0"; }
+      else if (healthyFilter === "true") { sql += " AND healthy=1"; }
+      sql += " ORDER BY createdAt DESC LIMIT ?";
+      sqlParams.push(limit);
+      const callRows = await query(sql, sqlParams);
+
+      // Parse JSON columns
+      const calls = callRows.map(r => ({
+        callId: r.callId,
+        sessionId: r.sessionId,
+        healthy: r.healthy === 1,
+        failureCount: r.failureCount,
+        failureCodes: safeJson(r.failureCodes, []),
+        severityBreakdown: safeJson(r.severityBreakdown, {}),
+        createdAt: r.createdAt,
+      }));
+
+      // Failure code breakdown (normalized)
+      const buckets = bucketRows.map(r => ({
+        code: String(r.phase).replace("qa_failure:", ""),
+        count: r.cnt,
+      }));
+
+      send(res, 200, {
+        hours,
+        summary: {
+          total: Number(totalRow?.total ?? 0),
+          healthy: Number(totalRow?.healthy ?? 0),
+          unhealthy: Number(totalRow?.unhealthy ?? 0),
+          healthRate: totalRow?.total > 0
+            ? Math.round((totalRow.healthy / totalRow.total) * 100)
+            : null,
+        },
+        failureBuckets: buckets,
+        calls,
+      });
+    } catch (e) { send(res, 500, { error: e.message }); }
+    return;
+  }
+
   // GET /metrics/calls/:callId
   const callMatch = path.match(/^\/metrics\/calls\/([^/]+)$/);
   if (callMatch && method === "GET") {
@@ -220,7 +329,7 @@ async function handle(req, res) {
   // 404
   send(res, 404, {
     error: "Not found",
-    endpoints: ["GET /api/health","GET /metrics/summary","GET /metrics/calls","GET /metrics/calls/:callId","GET /metrics/latency/histogram","POST /metrics/event"],
+    endpoints: ["GET /api/health","GET /metrics/summary","GET /metrics/calls","GET /metrics/calls/:callId","GET /metrics/latency/histogram","GET /metrics/quality","POST /metrics/event"],
   });
 }
 
